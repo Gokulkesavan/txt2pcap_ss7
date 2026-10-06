@@ -20,7 +20,7 @@
 <body>
 
 <h1>SS7 hexdump → PCAP</h1>
-<p class="hint">Converts <code>badAUS.txt</code> (SIP / M3UA / SCCP / MTP3 / TCAP / MAP hexdumps) into a Wireshark-readable <code>.pcap</code>.</p>
+<p class="hint">Converts <code>badAUS.txt</code> (SIP / M3UA / SCCP / MTP3 hexdumps) into a Wireshark-readable <code>.pcap</code>.</p>
 
 <label>1. Select the trace file</label>
 <input type="file" id="file" accept=".txt,.log">
@@ -56,8 +56,9 @@ const crc32c = buf => { let c=0xffffffff;
   return (c^0xffffffff)>>>0; };
 
 /* ---------- record parser ---------- */
+/* FIX: accept both \n and \r\n line endings */
 function parseRecords(text){
-  const chunks = text.split(/\n=+\n/);
+  const chunks = text.split(/\r?\n=+\r?\n/);
   const out = [];
   for(const chunk of chunks){
     if(!/\[No\.\s*\]/.test(chunk)) continue;
@@ -73,7 +74,6 @@ function parseRecords(text){
       src:   field("Source Address"),
       dst:   field("Destination Address"),
     };
-    // body starts after the [Msg Body] line; skip blank lines
     const lines = chunk.split(/\r?\n/);
     let i = 0;
     for(; i < lines.length; i++) if(/^\s*\[Msg Body\s*\]/.test(lines[i])){ i++; break; }
@@ -127,13 +127,13 @@ function sctp(sp,dp,ppid,payload){
   const chunkLen = dataLen + pad;
   const b = new Uint8Array(12 + chunkLen);
   b[0]=(sp>>>8)&0xff; b[1]=sp&0xff; b[2]=(dp>>>8)&0xff; b[3]=dp&0xff;
-  b[4]=0; b[5]=0; b[6]=0; b[7]=1;              // verification tag
+  b[4]=0; b[5]=0; b[6]=0; b[7]=1;
   let o = 12;
-  b[o++]=0; b[o++]=0x03;                       // DATA, B=1 E=1
+  b[o++]=0; b[o++]=0x03;
   b[o++]=(chunkLen>>>8)&0xff; b[o++]=chunkLen&0xff;
-  b[o++]=0; b[o++]=0; b[o++]=0; b[o++]=1;      // TSN
-  b[o++]=0; b[o++]=0;                          // stream id
-  b[o++]=0; b[o++]=0;                          // stream seq
+  b[o++]=0; b[o++]=0; b[o++]=0; b[o++]=1;
+  b[o++]=0; b[o++]=0;
+  b[o++]=0; b[o++]=0;
   b[o++]=(ppid>>>24)&0xff; b[o++]=(ppid>>>16)&0xff; b[o++]=(ppid>>>8)&0xff; b[o++]=ppid&0xff;
   b.set(payload,o);
   const cs = crc32c(b);
@@ -145,11 +145,11 @@ function sctp(sp,dp,ppid,payload){
 function m3uaData(payload, opc, dpc, si, ni){
   const len = 8 + 12 + payload.length;
   const b = new Uint8Array(len);
-  b[0]=1; b[1]=0; b[2]=1; b[3]=1;                 // ver=1, class=1 (Transfer), type=1 (DATA)
+  b[0]=1; b[1]=0; b[2]=1; b[3]=1;                 // ver=1 class=Transfer type=DATA
   b[4]=(len>>>24)&0xff; b[5]=(len>>>16)&0xff; b[6]=(len>>>8)&0xff; b[7]=len&0xff;
   b[8]=(opc>>>24)&0xff; b[9]=(opc>>>16)&0xff; b[10]=(opc>>>8)&0xff; b[11]=opc&0xff;
   b[12]=(dpc>>>24)&0xff; b[13]=(dpc>>>16)&0xff; b[14]=(dpc>>>8)&0xff; b[15]=dpc&0xff;
-  b[16]=si; b[17]=ni; b[18]=0; b[19]=0;           // SI=3 (SCCP), NI=2 (national)
+  b[16]=si; b[17]=ni; b[18]=0; b[19]=0;
   b.set(payload,20);
   return b;
 }
@@ -166,7 +166,7 @@ function writePcap(packets){
   dv.setInt32(o, 0, true);  o+=4;
   dv.setUint32(o, 0, true); o+=4;
   dv.setUint32(o, 65535, true); o+=4;
-  dv.setUint32(o, 1, true); o+=4;                // linktype=1 (Ethernet)
+  dv.setUint32(o, 1, true); o+=4;                // LINKTYPE_ETHERNET
   for(const p of packets){
     const s = Math.floor(p.ts), us = Math.floor((p.ts - s)*1e6);
     dv.setUint32(o, s, true); o+=4;
@@ -195,27 +195,42 @@ function buildPacket(rec){
       const p  = sipBytes(body);
       const l4 = udp(sa.port||5060, da.port||5060, p);
       const l3 = ipv4(sa.ip, da.ip, 17, l4);
-      return eth(MAC_A, MAC_B, l3);
+      return { kind: "sip", data: eth(MAC_A, MAC_B, l3) };
     }
   }
 
-  // 2) M3UA already on the wire
-  const first = (body.find(l => l.trim()) || "").trim();
-  const bytes = extractHexdump(body);
-  if(!bytes) return null;
+  // 2) Find the first non-empty body line — it's the struct marker
+  const marker = (body.find(l => l.trim()) || "").trim();
 
-  if(first === "M3UAMessage"){
+  // M3UA message on the wire (already includes full M3UA header)
+  if(marker === "M3UAMessage"){
+    const bytes = extractHexdump(body);
+    if(!bytes) return null;
     const l4 = sctp(2905, 2905, 3, bytes);
     const l3 = ipv4("10.0.0.1", "10.0.0.2", 132, l4);
-    return eth(MAC_A, MAC_B, l3);
+    return { kind: "m3ua", data: eth(MAC_A, MAC_B, l3) };
   }
 
-  // 3) Raw SCCP / MTP3 / TCAP / MAP hexdump -> wrap in synthetic M3UA DATA
-  if(/SCCP|MTP|MAP|TCAP|M3UA/i.test(iface)){
-    const m3ua = m3uaData(bytes, 1, 2, 3, 2);
-    const l4   = sctp(2905, 2905, 3, m3ua);
-    const l3   = ipv4("10.0.0.1", "10.0.0.2", 132, l4);
-    return eth(MAC_A, MAC_B, l3);
+  // MTP3 message: strip 6-byte MTP3 header, wrap SCCP part in M3UA DATA
+  if(marker === "MTP3Msg"){
+    const bytes = extractHexdump(body);
+    if(!bytes || bytes.length <= 6) return null;
+    const sccp = bytes.subarray(6);
+    const m3ua = m3uaData(sccp, 1, 2, 3, 2);
+    const l4 = sctp(2905, 2905, 3, m3ua);
+    const l3 = ipv4("10.0.0.1", "10.0.0.2", 132, l4);
+    return { kind: "m3ua", data: eth(MAC_A, MAC_B, l3) };
+  }
+
+  // SCCP message: strip 12-byte trace wrapper, wrap SCCP part in M3UA DATA
+  if(marker === "SCCPMessage"){
+    const bytes = extractHexdump(body);
+    if(!bytes || bytes.length <= 12) return null;
+    const sccp = bytes.subarray(12);
+    const m3ua = m3uaData(sccp, 1, 2, 3, 2);
+    const l4 = sctp(2905, 2905, 3, m3ua);
+    const l3 = ipv4("10.0.0.1", "10.0.0.2", 132, l4);
+    return { kind: "m3ua", data: eth(MAC_A, MAC_B, l3) };
   }
 
   return null;
@@ -227,24 +242,22 @@ function convert(text){
   log("Records parsed: " + recs.length);
 
   const packets = [];
-  let sipN = 0, m3uaN = 0, rawN = 0, skipN = 0;
+  let sipN = 0, m3uaN = 0, skipN = 0;
 
   for(const r of recs){
     const p = buildPacket(r);
     if(!p){ skipN++; continue; }
-    packets.push({ ts: parseTs(r.ts), data: p });
-
-    const iface = r.iface || "";
-    if(/FROM_SIP|TO_SIP/.test(iface))            sipN++;
-    else if(/M3UAMessage/.test(r.bodyLines.join("\n").slice(0,40))) m3uaN++;
-    else                                          rawN++;
+    packets.push({ ts: parseTs(r.ts), data: p.data });
+    if(p.kind === "sip") sipN++;
+    else if(p.kind === "m3ua") m3uaN++;
   }
 
   log("SIP packets    : " + sipN);
-  log("M3UA wire pkts : " + m3uaN);
-  log("Raw SS7 pkts   : " + rawN);
+  log("M3UA/SCCP pkts : " + m3uaN);
   log("Skipped        : " + skipN);
   log("Total packets  : " + packets.length);
+  log("----");
+  log("Tip: in Wireshark, use display filter 'sip || m3ua || sccp || tcap || gsm_map'");
 
   return writePcap(packets);
 }
