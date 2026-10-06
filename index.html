@@ -102,7 +102,7 @@ function sipBytes(lines){
   return new TextEncoder().encode(text);
 }
 
-/* ---------- L2/L3 builders ---------- */
+/* ---------- L2/L3/L4 builders ---------- */
 function eth(srcMac,dstMac,payload){
   const b=new Uint8Array(14+payload.length);
   b.set(dstMac,0); b.set(srcMac,6); b[12]=0x08; b[13]=0x00; b.set(payload,14); return b;
@@ -124,77 +124,50 @@ function udp(sp,dp,payload){
 /* ---------- SCTP with monotonic TSN ---------- */
 let sctpTSN = 0;
 function sctp(sp, dp, ppid, payload){
-  const dataLen  = 16 + payload.length;      // fixed DATA header + user data
-  const chunkLen = dataLen;                  // chunk length EXCLUDES padding
+  const dataLen  = 16 + payload.length;
+  const chunkLen = dataLen;
   const pad      = (4 - (dataLen % 4)) % 4;
   const b = new Uint8Array(12 + chunkLen + pad);
-  // SCTP common header (12 bytes)
   b[0]=(sp>>>8)&0xff; b[1]=sp&0xff;
   b[2]=(dp>>>8)&0xff; b[3]=dp&0xff;
-  b[4]=0; b[5]=0; b[6]=0; b[7]=1;            // verification tag
-  // DATA chunk header
+  b[4]=0; b[5]=0; b[6]=0; b[7]=1;
   let o = 12;
-  b[o++]=0; b[o++]=0x03;                     // type=DATA, B=1 E=1
+  b[o++]=0; b[o++]=0x03;
   b[o++]=(chunkLen>>>8)&0xff; b[o++]=chunkLen&0xff;
   const tsn = ++sctpTSN;
   b[o++]=(tsn>>>24)&0xff; b[o++]=(tsn>>>16)&0xff;
   b[o++]=(tsn>>>8)&0xff;  b[o++]=tsn&0xff;
-  b[o++]=0; b[o++]=0;                        // stream id
-  b[o++]=0; b[o++]=0;                        // stream seq
+  b[o++]=0; b[o++]=0;
+  b[o++]=0; b[o++]=0;
   b[o++]=(ppid>>>24)&0xff; b[o++]=(ppid>>>16)&0xff;
   b[o++]=(ppid>>>8)&0xff;  b[o++]=ppid&0xff;
   b.set(payload,o);
-  // CRC32c checksum goes at offset 8
   const cs = crc32c(b);
   b[8]=(cs>>>24)&0xff; b[9]=(cs>>>16)&0xff;
   b[10]=(cs>>>8)&0xff; b[11]=cs&0xff;
   return b;
 }
 
-/* ---------- M3UA DATA wrapper for raw SS7 payloads ---------- */
-/*
-   M3UA DATA message on the wire (RFC 4666 §3.3.1):
-     Bytes 0-3 : Version | Reserved | Msg Class (1=Transfer) | Msg Type (1=DATA)
-     Bytes 4-7 : Message Length (includes header)
-     Then parameters, each TLV-encoded:
-       Tag(2) | Length(2) | Value
-     Mandatory parameter is Protocol Data (0x0210):
-       OPC(4) | DPC(4) | SI(1) | NI(1) | MP(1) | SLS(1) | User Protocol Data(N)
-*/
+/* ---------- M3UA DATA (with mandatory Protocol Data TLV) ---------- */
 function m3uaData(payload, opc, dpc, si, ni){
-  const pdValueLen = 12 + payload.length;    // OPC+DPC+SI+NI+MP+SLS + payload
-  const pdParamLen = 4 + pdValueLen;         // TLV header + value
-  const msgLen     = 8 + pdParamLen;         // M3UA common header + Protocol Data param
+  const pdValueLen = 12 + payload.length;
+  const pdParamLen = 4 + pdValueLen;
+  const msgLen     = 8 + pdParamLen;
   const b = new Uint8Array(msgLen);
 
-  // M3UA common header
-  b[0] = 1;   // Version
-  b[1] = 0;   // Reserved
-  b[2] = 1;   // Message Class = Transfer
-  b[3] = 1;   // Message Type  = DATA
-  b[4] = (msgLen>>>24)&0xff;
-  b[5] = (msgLen>>>16)&0xff;
-  b[6] = (msgLen>>>8)&0xff;
-  b[7] =  msgLen&0xff;
+  b[0]=1; b[1]=0; b[2]=1; b[3]=1;
+  b[4]=(msgLen>>>24)&0xff; b[5]=(msgLen>>>16)&0xff;
+  b[6]=(msgLen>>>8)&0xff;  b[7]= msgLen&0xff;
 
-  // Protocol Data parameter (TLV)
-  b[8]  = 0x02; b[9]  = 0x10;                // tag = 0x0210
-  b[10] = (pdParamLen>>>8)&0xff;
-  b[11] =  pdParamLen&0xff;
+  // Protocol Data parameter
+  b[8]=0x02; b[9]=0x10;
+  b[10]=(pdParamLen>>>8)&0xff; b[11]=pdParamLen&0xff;
 
-  // OPC (32 bits, only lower 24 usually used)
-  b[12] = (opc>>>24)&0xff; b[13] = (opc>>>16)&0xff;
-  b[14] = (opc>>>8)&0xff;  b[15] =  opc&0xff;
-  // DPC
-  b[16] = (dpc>>>24)&0xff; b[17] = (dpc>>>16)&0xff;
-  b[18] = (dpc>>>8)&0xff;  b[19] =  dpc&0xff;
-  // SI, NI, MP, SLS
-  b[20] = si;
-  b[21] = ni;
-  b[22] = 0;                                 // Message Priority
-  b[23] = 0;                                 // Signalling Link Selection
-
-  // User Protocol Data
+  // OPC / DPC
+  b[12]=(opc>>>24)&0xff; b[13]=(opc>>>16)&0xff; b[14]=(opc>>>8)&0xff; b[15]=opc&0xff;
+  b[16]=(dpc>>>24)&0xff; b[17]=(dpc>>>16)&0xff; b[18]=(dpc>>>8)&0xff; b[19]=dpc&0xff;
+  // SI / NI / MP / SLS
+  b[20]=si; b[21]=ni; b[22]=0; b[23]=0;
   b.set(payload, 24);
   return b;
 }
@@ -211,7 +184,7 @@ function writePcap(packets){
   dv.setInt32(o, 0, true);  o+=4;
   dv.setUint32(o, 0, true); o+=4;
   dv.setUint32(o, 65535, true); o+=4;
-  dv.setUint32(o, 1, true); o+=4;            // LINKTYPE_ETHERNET
+  dv.setUint32(o, 1, true); o+=4; // LINKTYPE_ETHERNET
   for(const p of packets){
     const s = Math.floor(p.ts), us = Math.floor((p.ts - s)*1e6);
     dv.setUint32(o, s, true); o+=4;
@@ -223,9 +196,31 @@ function writePcap(packets){
   return buf;
 }
 
-/* ---------- MACs ---------- */
 const MAC_A = new Uint8Array([0x02,0,0,0,0,0x01]);
 const MAC_B = new Uint8Array([0x02,0,0,0,0,0x02]);
+
+/* ---------- wrap an SCCP UDT chunk into M3UA/SCTP/IP/Eth ---------- */
+function wrapSCCP(sccpUdt){
+  const m3ua = m3uaData(sccpUdt, 1, 2, 3, 2);   // OPC=1 DPC=2 SI=3(SCCP) NI=2(national)
+  const l4   = sctp(2905, 2905, 3, m3ua);       // PPID=3 (M3UA)
+  const l3   = ipv4("10.0.0.1", "10.0.0.2", 132, l4);
+  return eth(MAC_A, MAC_B, l3);
+}
+
+/* ---------- find the protocol-class byte (0x80..0x83) followed by valid pointers ---------- */
+function findSCCPProtoClass(bytes, startSearch){
+  for(let i = startSearch; i < bytes.length - 4; i++){
+    const pc = bytes[i];
+    if(pc < 0x80 || pc > 0x83) continue;
+    const p1 = bytes[i+1], p2 = bytes[i+2], p3 = bytes[i+3];
+    if(p1 >= 3 && p1 <= 15 &&
+       p2 >= p1 + 3 && p2 <= 40 &&
+       p3 >= p2 + 3 && p3 <= 80){
+      return i;
+    }
+  }
+  return -1;
+}
 
 /* ---------- record -> packet ---------- */
 function buildPacket(rec){
@@ -233,7 +228,7 @@ function buildPacket(rec){
   const body  = rec.bodyLines;
   if(!body.length) return null;
 
-  // 1) SIP wire traffic (UDP/5060)
+  // 1) SIP over UDP
   if(/FROM_SIP|TO_SIP/.test(iface) && isSIPMessage(body)){
     const sa = parseAddr(rec.src), da = parseAddr(rec.dst);
     if(sa && da){
@@ -245,36 +240,40 @@ function buildPacket(rec){
   }
 
   const marker = (body.find(l => l.trim()) || "").trim();
+  const bytes  = extractHexdump(body);
 
-  // 2) M3UA message already on the wire (record's body is the full M3UA PDU)
+  // 2) M3UA already on the wire
   if(marker === "M3UAMessage"){
-    const bytes = extractHexdump(body);
     if(!bytes) return null;
     const l4 = sctp(2905, 2905, 3, bytes);
     const l3 = ipv4("10.0.0.1", "10.0.0.2", 132, l4);
     return { kind: "m3ua", data: eth(MAC_A, MAC_B, l3) };
   }
 
-  // 3) MTP3Msg: strip 6-byte MTP3 header, wrap SCCP part in M3UA DATA
+  // 3) MTP3Msg: [6-byte MTP3 hdr][SCCP UDT starting with 0x09]
   if(marker === "MTP3Msg"){
-    const bytes = extractHexdump(body);
     if(!bytes || bytes.length <= 6) return null;
-    const sccp = bytes.subarray(6);
-    const m3ua = m3uaData(sccp, 1, 2, 3, 2);
-    const l4 = sctp(2905, 2905, 3, m3ua);
-    const l3 = ipv4("10.0.0.1", "10.0.0.2", 132, l4);
-    return { kind: "m3ua", data: eth(MAC_A, MAC_B, l3) };
+    return { kind: "m3ua", data: wrapSCCP(bytes.subarray(6)) };
   }
 
-  // 4) SCCPMessage: strip 12-byte trace wrapper, wrap SCCP part in M3UA DATA
+  // 4) SCCPMessage: [12-byte trace hdr][SCCP UDT starting with 0x09]
   if(marker === "SCCPMessage"){
-    const bytes = extractHexdump(body);
     if(!bytes || bytes.length <= 12) return null;
-    const sccp = bytes.subarray(12);
-    const m3ua = m3uaData(sccp, 1, 2, 3, 2);
-    const l4 = sctp(2905, 2905, 3, m3ua);
-    const l3 = ipv4("10.0.0.1", "10.0.0.2", 132, l4);
-    return { kind: "m3ua", data: eth(MAC_A, MAC_B, l3) };
+    return { kind: "m3ua", data: wrapSCCP(bytes.subarray(12)) };
+  }
+
+  // 5) SCCPUSERMessage / TCAPSCCPMessage:
+  //    N-UNITDATA wrapper + SCCP UDT whose 0x09 (UDT) byte is not shown.
+  //    Find the protocol-class byte and rebuild: [09][protocol-class][ptrs]...
+  if(marker === "SCCPUSERMessage" || marker === "TCAPSCCPMessage"){
+    if(!bytes) return null;
+    const pc = findSCCPProtoClass(bytes, 5);
+    if(pc < 0) return null;
+    const rest = bytes.subarray(pc);
+    const sccpUdt = new Uint8Array(1 + rest.length);
+    sccpUdt[0] = 0x09;         // UDT message-type indicator
+    sccpUdt.set(rest, 1);
+    return { kind: "m3ua", data: wrapSCCP(sccpUdt) };
   }
 
   return null;
@@ -282,7 +281,7 @@ function buildPacket(rec){
 
 /* ---------- main ---------- */
 function convert(text){
-  sctpTSN = 0;                     // reset TSN counter per conversion
+  sctpTSN = 0;
   const recs = parseRecords(text);
   log("Records parsed: " + recs.length);
 
@@ -293,16 +292,16 @@ function convert(text){
     const p = buildPacket(r);
     if(!p){ skipN++; continue; }
     packets.push({ ts: parseTs(r.ts), data: p.data });
-    if(p.kind === "sip") sipN++;
-    else if(p.kind === "m3ua") m3uaN++;
+    if(p.kind === "sip")  sipN++;
+    else                  m3uaN++;
   }
 
-  log("SIP packets    : " + sipN);
-  log("M3UA/SCCP pkts : " + m3uaN);
-  log("Skipped        : " + skipN);
-  log("Total packets  : " + packets.length);
+  log("SIP packets       : " + sipN);
+  log("SS7 packets (M3UA): " + m3uaN);
+  log("Skipped           : " + skipN);
+  log("Total packets     : " + packets.length);
   log("----");
-  log("Tip: in Wireshark, use display filter 'sip || m3ua || sccp || tcap || gsm_map'");
+  log("Wireshark filter: sip || m3ua || sccp || tcap || gsm_map");
 
   return writePcap(packets);
 }
