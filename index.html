@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SS7 hexdump → PCAP</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 40px auto; padding: 20px; color:#222; }
+  h1 { font-size: 20px; }
+  label { display:block; margin: 14px 0 4px; font-weight:600; }
+  button { padding: 10px 20px; font-size: 14px; cursor: pointer; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  #download { display:none; margin-top:16px; padding:10px 20px; background:#0a7; color:#fff;
+              text-decoration:none; border-radius:4px; }
+  #download:hover { background:#085; }
+  #log { background:#f5f5f5; padding:12px; border-radius:4px; max-height:320px; overflow:auto;
+         font-family:monospace; font-size:12px; white-space:pre-wrap; }
+  .hint { color:#666; font-size:13px; }
+</style>
+</head>
+<body>
+
+<h1>SS7 hexdump → PCAP</h1>
+<p class="hint">Converts <code>badAUS.txt</code> (SIP / M3UA / SCCP / MTP3 / TCAP / MAP hexdumps) into a Wireshark-readable <code>.pcap</code>.</p>
+
+<label>1. Select the trace file</label>
+<input type="file" id="file" accept=".txt,.log">
+
+<label>2. Convert</label>
+<button id="convert" disabled>Convert → PCAP</button>
+
+<a id="download">⬇ Download .pcap</a>
+
+<label>3. Log</label>
+<pre id="log"></pre>
+
+<script>
+"use strict";
+
+/* ---------- helpers ---------- */
+const log = m => { const e=document.getElementById("log"); e.textContent += m+"\n"; e.scrollTop=e.scrollHeight; };
+
+const parseTs = s => {
+  const m = /(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})\.(\d{3})/.exec(s||"");
+  return m ? Date.UTC(+m[1],+m[2]-1,+m[3],+m[4],+m[5],+m[6],+m[7])/1000 : Date.now()/1000;
+};
+
+const parseAddr = s => { const m=/^\s*([\d.]+)(?::(\d+))?/.exec(s||""); return m?{ip:m[1],port:m[2]?+m[2]:0}:null; };
+const ipBytes = ip => ip.split(".").map(n=>+n);
+
+/* ---------- CRC32c for SCTP checksum ---------- */
+const CRC_TABLE = (()=>{ const t=new Uint32Array(256);
+  for(let n=0;n<256;n++){let c=n;for(let k=0;k<8;k++)c=c&1?0x82f63b78^(c>>>1):c>>>1;t[n]=c>>>0;}
+  return t;})();
+const crc32c = buf => { let c=0xffffffff;
+  for(let i=0;i<buf.length;i++) c=(CRC_TABLE[(c^buf[i])&0xff]^(c>>>8))>>>0;
+  return (c^0xffffffff)>>>0; };
+
+/* ---------- record parser ---------- */
+function parseRecords(text){
+  const chunks = text.split(/\n=+\n/);
+  const out = [];
+  for(const chunk of chunks){
+    if(!/\[No\.\s*\]/.test(chunk)) continue;
+    const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g,"\\$&");
+    const field = name => {
+      const m = new RegExp("\\["+esc(name)+"\\s*\\]\\s*([^\\r\\n]*)").exec(chunk);
+      return m ? m[1].trim() : "";
+    };
+    const rec = {
+      ts:    field("TimeStamp"),
+      iface: field("Msg Interface"),
+      type:  field("Msg Type"),
+      src:   field("Source Address"),
+      dst:   field("Destination Address"),
+    };
+    // body starts after the [Msg Body] line; skip blank lines
+    const lines = chunk.split(/\r?\n/);
+    let i = 0;
+    for(; i < lines.length; i++) if(/^\s*\[Msg Body\s*\]/.test(lines[i])){ i++; break; }
+    while(i<lines.length && lines[i].trim()==="") i++;
+    rec.bodyLines = lines.slice(i);
+    out.push(rec);
+  }
+  return out;
+}
+
+/* ---------- body interpreters ---------- */
+const HEXDUMP_LINE = /^\s*\d+>\s+([0-9A-Fa-f]{2})\s/;
+function extractHexdump(lines){
+  const bytes=[];
+  for(const ln of lines){ const m=HEXDUMP_LINE.exec(ln); if(m) bytes.push(parseInt(m[1],16)); }
+  return bytes.length ? new Uint8Array(bytes) : null;
+}
+
+function isSIPMessage(lines){
+  for(const ln of lines){ const t=ln.trim(); if(!t) continue;
+    return /^(INVITE|ACK|BYE|CANCEL|REGISTER|OPTIONS|INFO|UPDATE|PRACK|REFER|SUBSCRIBE|NOTIFY|MESSAGE|SIP\/2\.0)\b/.test(t); }
+  return false;
+}
+
+function sipBytes(lines){
+  const text = lines.join("\r\n").replace(/(\r\n)+$/,"") + "\r\n\r\n";
+  return new TextEncoder().encode(text);
+}
+
+/* ---------- L2/L3/L4 builders ---------- */
+function eth(srcMac,dstMac,payload){
+  const b=new Uint8Array(14+payload.length);
+  b.set(dstMac,0); b.set(srcMac,6); b[12]=0x08; b[13]=0x00; b.set(payload,14); return b;
+}
+function ipv4(src,dst,proto,payload){
+  const b=new Uint8Array(20+payload.length); b[0]=0x45;
+  const len=20+payload.length; b[2]=(len>>>8)&0xff; b[3]=len&0xff;
+  b[8]=64; b[9]=proto; b.set(ipBytes(src),12); b.set(ipBytes(dst),16);
+  let s=0; for(let i=0;i<20;i+=2) s+=(b[i]<<8)|b[i+1];
+  while(s>>>16) s=(s&0xffff)+(s>>>16);
+  s=~s&0xffff; b[10]=(s>>>8)&0xff; b[11]=s&0xff; b.set(payload,20); return b;
+}
+function udp(sp,dp,payload){
+  const b=new Uint8Array(8+payload.length);
+  b[0]=(sp>>>8)&0xff; b[1]=sp&0xff; b[2]=(dp>>>8)&0xff; b[3]=dp&0xff;
+  const len=8+payload.length; b[4]=(len>>>8)&0xff; b[5]=len&0xff; b.set(payload,8); return b;
+}
+function sctp(sp,dp,ppid,payload){
+  const dataLen = 16 + payload.length;
+  const pad = (4 - (dataLen % 4)) % 4;
+  const chunkLen = dataLen + pad;
+  const b = new Uint8Array(12 + chunkLen);
+  b[0]=(sp>>>8)&0xff; b[1]=sp&0xff; b[2]=(dp>>>8)&0xff; b[3]=dp&0xff;
+  b[4]=0; b[5]=0; b[6]=0; b[7]=1;              // verification tag
+  let o = 12;
+  b[o++]=0; b[o++]=0x03;                       // DATA, B=1 E=1
+  b[o++]=(chunkLen>>>8)&0xff; b[o++]=chunkLen&0xff;
+  b[o++]=0; b[o++]=0; b[o++]=0; b[o++]=1;      // TSN
+  b[o++]=0; b[o++]=0;                          // stream id
+  b[o++]=0; b[o++]=0;                          // stream seq
+  b[o++]=(ppid>>>24)&0xff; b[o++]=(ppid>>>16)&0xff; b[o++]=(ppid>>>8)&0xff; b[o++]=ppid&0xff;
+  b.set(payload,o);
+  const cs = crc32c(b);
+  b[8]=(cs>>>24)&0xff; b[9]=(cs>>>16)&0xff; b[10]=(cs>>>8)&0xff; b[11]=cs&0xff;
+  return b;
+}
+
+/* ---------- M3UA DATA wrapper for raw SS7 payloads ---------- */
+function m3uaData(payload, opc, dpc, si, ni){
+  const len = 8 + 12 + payload.length;
+  const b = new Uint8Array(len);
+  b[0]=1; b[1]=0; b[2]=1; b[3]=1;                 // ver=1, class=1 (Transfer), type=1 (DATA)
+  b[4]=(len>>>24)&0xff; b[5]=(len>>>16)&0xff; b[6]=(len>>>8)&0xff; b[7]=len&0xff;
+  b[8]=(opc>>>24)&0xff; b[9]=(opc>>>16)&0xff; b[10]=(opc>>>8)&0xff; b[11]=opc&0xff;
+  b[12]=(dpc>>>24)&0xff; b[13]=(dpc>>>16)&0xff; b[14]=(dpc>>>8)&0xff; b[15]=dpc&0xff;
+  b[16]=si; b[17]=ni; b[18]=0; b[19]=0;           // SI=3 (SCCP), NI=2 (national)
+  b.set(payload,20);
+  return b;
+}
+
+/* ---------- pcap writer ---------- */
+function writePcap(packets){
+  const total = 24 + packets.reduce((a,p)=>a+16+p.data.length,0);
+  const buf = new ArrayBuffer(total);
+  const dv = new DataView(buf); const u8 = new Uint8Array(buf);
+  let o = 0;
+  dv.setUint32(o, 0xa1b2c3d4, true); o+=4;
+  dv.setUint16(o, 2, true); o+=2;
+  dv.setUint16(o, 4, true); o+=2;
+  dv.setInt32(o, 0, true);  o+=4;
+  dv.setUint32(o, 0, true); o+=4;
+  dv.setUint32(o, 65535, true); o+=4;
+  dv.setUint32(o, 1, true); o+=4;                // linktype=1 (Ethernet)
+  for(const p of packets){
+    const s = Math.floor(p.ts), us = Math.floor((p.ts - s)*1e6);
+    dv.setUint32(o, s, true); o+=4;
+    dv.setUint32(o, us, true); o+=4;
+    dv.setUint32(o, p.data.length, true); o+=4;
+    dv.setUint32(o, p.data.length, true); o+=4;
+    u8.set(p.data, o); o += p.data.length;
+  }
+  return buf;
+}
+
+/* ---------- MACs ---------- */
+const MAC_A = new Uint8Array([0x02,0,0,0,0,0x01]);
+const MAC_B = new Uint8Array([0x02,0,0,0,0,0x02]);
+
+/* ---------- record -> packet ---------- */
+function buildPacket(rec){
+  const iface = rec.iface || "";
+  const body  = rec.bodyLines;
+  if(!body.length) return null;
+
+  // 1) SIP wire traffic
+  if(/FROM_SIP|TO_SIP/.test(iface) && isSIPMessage(body)){
+    const sa = parseAddr(rec.src), da = parseAddr(rec.dst);
+    if(sa && da){
+      const p  = sipBytes(body);
+      const l4 = udp(sa.port||5060, da.port||5060, p);
+      const l3 = ipv4(sa.ip, da.ip, 17, l4);
+      return eth(MAC_A, MAC_B, l3);
+    }
+  }
+
+  // 2) M3UA already on the wire
+  const first = (body.find(l => l.trim()) || "").trim();
+  const bytes = extractHexdump(body);
+  if(!bytes) return null;
+
+  if(first === "M3UAMessage"){
+    const l4 = sctp(2905, 2905, 3, bytes);
+    const l3 = ipv4("10.0.0.1", "10.0.0.2", 132, l4);
+    return eth(MAC_A, MAC_B, l3);
+  }
+
+  // 3) Raw SCCP / MTP3 / TCAP / MAP hexdump -> wrap in synthetic M3UA DATA
+  if(/SCCP|MTP|MAP|TCAP|M3UA/i.test(iface)){
+    const m3ua = m3uaData(bytes, 1, 2, 3, 2);
+    const l4   = sctp(2905, 2905, 3, m3ua);
+    const l3   = ipv4("10.0.0.1", "10.0.0.2", 132, l4);
+    return eth(MAC_A, MAC_B, l3);
+  }
+
+  return null;
+}
+
+/* ---------- main ---------- */
+function convert(text){
+  const recs = parseRecords(text);
+  log("Records parsed: " + recs.length);
+
+  const packets = [];
+  let sipN = 0, m3uaN = 0, rawN = 0, skipN = 0;
+
+  for(const r of recs){
+    const p = buildPacket(r);
+    if(!p){ skipN++; continue; }
+    packets.push({ ts: parseTs(r.ts), data: p });
+
+    const iface = r.iface || "";
+    if(/FROM_SIP|TO_SIP/.test(iface))            sipN++;
+    else if(/M3UAMessage/.test(r.bodyLines.join("\n").slice(0,40))) m3uaN++;
+    else                                          rawN++;
+  }
+
+  log("SIP packets    : " + sipN);
+  log("M3UA wire pkts : " + m3uaN);
+  log("Raw SS7 pkts   : " + rawN);
+  log("Skipped        : " + skipN);
+  log("Total packets  : " + packets.length);
+
+  return writePcap(packets);
+}
+
+/* ---------- UI ---------- */
+const fileEl = document.getElementById("file");
+const btnEl  = document.getElementById("convert");
+const dlEl   = document.getElementById("download");
+
+fileEl.onchange = () => {
+  btnEl.disabled = !fileEl.files[0];
+  document.getElementById("log").textContent = "";
+  dlEl.style.display = "none";
+};
+
+btnEl.onclick = async () => {
+  const f = fileEl.files[0]; if(!f) return;
+  btnEl.disabled = true;
+  log("Reading " + f.name + " (" + f.size + " bytes) ...");
+  try {
+    const text = await f.text();
+    log("Converting ...");
+    const pcap = convert(text);
+    const blob = new Blob([pcap], { type: "application/vnd.tcpdump.pcap" });
+    dlEl.href = URL.createObjectURL(blob);
+    dlEl.download = f.name.replace(/\.(txt|log)$/i,"") + ".pcap";
+    dlEl.style.display = "inline-block";
+    dlEl.textContent = "⬇ Download " + dlEl.download;
+    log("Done.");
+  } catch(e){
+    log("ERROR: " + e.message);
+    console.error(e);
+  } finally {
+    btnEl.disabled = false;
+  }
+};
+</script>
+</body>
+</html>
