@@ -74,10 +74,18 @@ function parseRecords(text){
       dst:   field("Destination Address"),
     };
     const lines = chunk.split(/\r?\n/);
-    let i = 0;
-    for(; i < lines.length; i++) if(/^\s*\[Msg Body\s*\]/.test(lines[i])){ i++; break; }
-    while(i<lines.length && lines[i].trim()==="") i++;
-    rec.bodyLines = lines.slice(i);
+    let bodyIndex = -1;
+    let inlineBody = "";
+    for(let i = 0; i < lines.length; i++){
+      const m = /^\s*\[Msg Body\s*\]\s*(.*)$/.exec(lines[i]);
+      if(m){ bodyIndex = i; inlineBody = m[1].trim(); break; }
+    }
+    // Huawei PTMF writes the complete hex payload on the SAME line as
+    // [Msg Body]. Keep that payload; older exports may put it on following
+    // lines, so retain those too.
+    rec.bodyLines = [];
+    if(inlineBody) rec.bodyLines.push(inlineBody);
+    if(bodyIndex >= 0) rec.bodyLines.push(...lines.slice(bodyIndex + 1));
     out.push(rec);
   }
   return out;
@@ -237,6 +245,21 @@ function findSCCPProtoClass(bytes, startSearch){
   return -1;
 }
 
+/* ---------- INAP application-context identification ---------- */
+// ETSI INAP CS2 application-context OID seen in the supplied Huawei trace:
+// 0.0.17.773.5.1.1.1 => 06 07 00 11 86 05 01 01 01
+const INAP_CS2_OID = new Uint8Array([0x06,0x07,0x00,0x11,0x86,0x05,0x01,0x01,0x01]);
+function hasInapApplicationContext(bytes){
+  if(!bytes) return false;
+  outer: for(let i=0;i<=bytes.length-INAP_CS2_OID.length;i++){
+    for(let j=0;j<INAP_CS2_OID.length;j++){
+      if(bytes[i+j]!==INAP_CS2_OID[j]) continue outer;
+    }
+    return true;
+  }
+  return false;
+}
+
 /* ---------- record -> packet ---------- */
 function buildPacket(rec){
   const iface = rec.iface || "";
@@ -275,7 +298,12 @@ function buildPacket(rec){
   //    records are internal stack views of the same signalling exchange.
   if(iface === "TRC_MI_SCCPDPC_MSG" && rec.type === "UDT"){
     if(!bytes || bytes.length <= 12 || bytes[12] !== 0x09) return null;
-    return { kind: "tcap", data: wrapSCCP(bytes.subarray(12)) };
+    const sccpUdt = bytes.subarray(12);
+    return {
+      kind: "tcap",
+      inap: hasInapApplicationContext(sccpUdt),
+      data: wrapSCCP(sccpUdt)
+    };
   }
 
   // 4) MTP3Msg: [6-byte MTP3 hdr][SCCP UDT starting with 0x09]
@@ -314,20 +342,23 @@ function convert(text){
   log("Records parsed: " + recs.length);
 
   const packets = [];
-  let sipN = 0, m3uaN = 0, tcapN = 0, skipN = 0;
+  let sipN = 0, m3uaN = 0, tcapN = 0, inapN = 0, skipN = 0;
 
   for(const r of recs){
     const p = buildPacket(r);
     if(!p){ skipN++; continue; }
     packets.push({ ts: parseTs(r.ts), data: p.data });
     if(p.kind === "sip")       sipN++;
-    else if(p.kind === "tcap") tcapN++;
-    else                      m3uaN++;
+    else if(p.kind === "tcap"){
+      tcapN++;
+      if(p.inap) inapN++;
+    } else m3uaN++;
   }
 
   log("SIP packets       : " + sipN);
   log("SS7 packets (M3UA): " + m3uaN);
-  log("TCAP/CAP packets   : " + tcapN);
+  log("TCAP packets       : " + tcapN);
+  log("INAP CS2 packets   : " + inapN);
   log("Skipped           : " + skipN);
   log("Total packets     : " + packets.length);
   log("----");
