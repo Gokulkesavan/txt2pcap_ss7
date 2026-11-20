@@ -238,19 +238,22 @@ function buildPacket(rec){
   const body  = rec.bodyLines;
   if(!body.length) return null;
 
-  // 1) SIP over UDP
-  if(/FROM_SIP|TO_SIP/.test(iface) && isSIPMessage(body)){
+  const marker = (body.find(l => l.trim()) || "").trim();
+  const bytes  = extractHexdump(body);
+
+  // 1) SIP over UDP. Huawei PTMF exports can store SIP as ASCII hex bytes,
+  //    while other supported exports contain the SIP text directly.
+  const decodedHex = bytes ? new TextDecoder().decode(bytes) : "";
+  const sipIsHex = !!bytes && isSIPMessage([decodedHex]);
+  if(/FROM_SIP|TO_SIP/.test(iface) && (isSIPMessage(body) || sipIsHex)){
     const sa = parseAddr(rec.src), da = parseAddr(rec.dst);
     if(sa && da){
-      const p  = sipBytes(body);
+      const p  = sipIsHex ? bytes : sipBytes(body);
       const l4 = udp(sa.port||5060, da.port||5060, p);
       const l3 = ipv4(sa.ip, da.ip, 17, l4);
       return { kind: "sip", data: eth(MAC_A, MAC_B, l3) };
     }
   }
-
-  const marker = (body.find(l => l.trim()) || "").trim();
-  const bytes  = extractHexdump(body);
 
   // 2) M3UA already on the wire
   if(marker === "M3UAMessage"){
@@ -276,13 +279,13 @@ function buildPacket(rec){
     return { kind: "m3ua", data: wrapSCCP(bytes.subarray(6)) };
   }
 
-  // 4) SCCPMessage: [12-byte trace hdr][SCCP UDT starting with 0x09]
+  // 5) SCCPMessage: [12-byte trace hdr][SCCP UDT starting with 0x09]
   if(marker === "SCCPMessage"){
     if(!bytes || bytes.length <= 12) return null;
     return { kind: "m3ua", data: wrapSCCP(bytes.subarray(12)) };
   }
 
-  // 5) SCCPUSERMessage / TCAPSCCPMessage:
+  // 6) SCCPUSERMessage / TCAPSCCPMessage:
   //    N-UNITDATA wrapper + SCCP UDT whose 0x09 (UDT) byte is not shown.
   //    Find the protocol-class byte and rebuild: [09][protocol-class][ptrs]...
   if(marker === "SCCPUSERMessage" || marker === "TCAPSCCPMessage"){
