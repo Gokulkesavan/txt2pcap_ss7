@@ -10,7 +10,9 @@ Converts Huawei UGC/MSOFTX PTMF-derived text exports into a Wireshark-readable E
 
 ## TCAP / CAP / INAP payload handling
 
-The TCAP BER payload is preserved byte-for-byte inside SCCP user data. This allows Wireshark to dissect TCAP and, where the application-context OID and operation definitions are recognized, the corresponding CAP/INAP application layer.
+Huawei PTMF places the hex data on the same line as `[Msg Body]`. The parser retains this inline data (and also supports payload lines following the marker); without this, the packet builder receives empty bodies.
+
+The TCAP BER payload is preserved byte-for-byte inside SCCP user data. The converter identifies the INAP CS2 application-context OID `0.0.17.773.5.1.1.1` (`06 07 00 11 86 05 01 01 01`) and reports how many reconstructed SCCP packets contain it. Wireshark can then dissect TCAP and the applicable INAP/CAP layer when its protocol dissectors recognize the context and operation definitions.
 
 The converter uses `TRC_MI_SCCPDPC_MSG` as the network-facing packet source. It does not separately emit `TRC_MI_TCAPUSER_MSG`, `TRC_MI_FROM_CAP`, `TRC_MI_TO_CAP`, `TRC_MI_TCAPSCCP_MSG`, or `TRC_MI_SCCPUSER_MSG` primitive/interface views as additional packets, avoiding duplicate representations of the same exchange.
 
@@ -22,8 +24,10 @@ The converter uses `TRC_MI_SCCPDPC_MSG` as the network-facing packet source. It 
 
 ## Use
 
-Open the page, select the Huawei-derived `.txt` export, and choose **Convert → PCAP**. Open the downloaded file in Wireshark and use:
+Open the page, select the Huawei-derived `.txt` export, and choose **Convert → PCAP**. The conversion log includes the number of packets carrying the identified INAP CS2 application context.
+
+Open the downloaded file in Wireshark and use:
 
 ```
-sip || m3ua || sccp || tcap || gsm_map
+sip || m3ua || sccp || tcap || inap
 ```
