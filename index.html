@@ -84,10 +84,20 @@ function parseRecords(text){
 }
 
 /* ---------- body interpreters ---------- */
-const HEXDUMP_LINE = /^\s*\d+>\s+([0-9A-Fa-f]{2})\s/;
+const HEXDUMP_LINE = /^\s*\d+>\s*(.*)$/;
 function extractHexdump(lines){
   const bytes=[];
-  for(const ln of lines){ const m=HEXDUMP_LINE.exec(ln); if(m) bytes.push(parseInt(m[1],16)); }
+  for(const ln of lines){
+    const numbered = HEXDUMP_LINE.exec(ln);
+    const data = numbered ? numbered[1] : ln.trim();
+    if(!data) continue;
+    const tokens = data.split(/\s+/);
+    // PTMF exports may contain either "NN> AA BB CC" rows or a
+    // single space-separated hex string after [Msg Body].
+    if(tokens.every(t => /^[0-9A-Fa-f]{2}$/.test(t))){
+      for(const t of tokens) bytes.push(parseInt(t,16));
+    }
+  }
   return bytes.length ? new Uint8Array(bytes) : null;
 }
 
@@ -250,7 +260,17 @@ function buildPacket(rec){
     return { kind: "m3ua", data: eth(MAC_A, MAC_B, l3) };
   }
 
-  // 3) MTP3Msg: [6-byte MTP3 hdr][SCCP UDT starting with 0x09]
+  // 3) Huawei PTMF network-side SCCP trace:
+  //    TRC_MI_SCCPDPC_MSG / UDT carries a 12-byte trace/MTP3 prefix,
+  //    followed by the actual SCCP UDT (0x09) and its TCAP BER payload.
+  //    Emit only this network-facing record; TCAPUSER/CAP and TCAPSCCP
+  //    records are internal stack views of the same signalling exchange.
+  if(iface === "TRC_MI_SCCPDPC_MSG" && rec.type === "UDT"){
+    if(!bytes || bytes.length <= 12 || bytes[12] !== 0x09) return null;
+    return { kind: "tcap", data: wrapSCCP(bytes.subarray(12)) };
+  }
+
+  // 4) MTP3Msg: [6-byte MTP3 hdr][SCCP UDT starting with 0x09]
   if(marker === "MTP3Msg"){
     if(!bytes || bytes.length <= 6) return null;
     return { kind: "m3ua", data: wrapSCCP(bytes.subarray(6)) };
@@ -286,21 +306,24 @@ function convert(text){
   log("Records parsed: " + recs.length);
 
   const packets = [];
-  let sipN = 0, m3uaN = 0, skipN = 0;
+  let sipN = 0, m3uaN = 0, tcapN = 0, skipN = 0;
 
   for(const r of recs){
     const p = buildPacket(r);
     if(!p){ skipN++; continue; }
     packets.push({ ts: parseTs(r.ts), data: p.data });
-    if(p.kind === "sip")  sipN++;
-    else                  m3uaN++;
+    if(p.kind === "sip")       sipN++;
+    else if(p.kind === "tcap") tcapN++;
+    else                      m3uaN++;
   }
 
   log("SIP packets       : " + sipN);
   log("SS7 packets (M3UA): " + m3uaN);
+  log("TCAP/CAP packets   : " + tcapN);
   log("Skipped           : " + skipN);
   log("Total packets     : " + packets.length);
   log("----");
+  log("TCAP/CAP BER payloads are preserved inside SCCP user data.");
   log("Wireshark filter: sip || m3ua || sccp || tcap || gsm_map");
 
   return writePcap(packets);
