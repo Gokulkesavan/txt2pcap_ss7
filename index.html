@@ -172,7 +172,7 @@ function sctp(sp, dp, ppid, payload){
 }
 
 /* ---------- M3UA DATA (with mandatory Protocol Data TLV) ---------- */
-function m3uaData(payload, opc, dpc, si, ni){
+function m3uaData(payload, opc, dpc, si, ni, sls=0){
   const pdValueLen = 12 + payload.length;
   const pdParamLen = 4 + pdValueLen;
   const msgLen     = 8 + pdParamLen;
@@ -190,7 +190,7 @@ function m3uaData(payload, opc, dpc, si, ni){
   b[12]=(opc>>>24)&0xff; b[13]=(opc>>>16)&0xff; b[14]=(opc>>>8)&0xff; b[15]=opc&0xff;
   b[16]=(dpc>>>24)&0xff; b[17]=(dpc>>>16)&0xff; b[18]=(dpc>>>8)&0xff; b[19]=dpc&0xff;
   // SI / NI / MP / SLS
-  b[20]=si; b[21]=ni; b[22]=0; b[23]=0;
+  b[20]=si; b[21]=ni; b[22]=0; b[23]=sls;
   b.set(payload, 24);
   return b;
 }
@@ -223,10 +223,14 @@ const MAC_A = new Uint8Array([0x02,0,0,0,0,0x01]);
 const MAC_B = new Uint8Array([0x02,0,0,0,0,0x02]);
 
 /* ---------- wrap an SCCP UDT chunk into M3UA/SCTP/IP/Eth ---------- */
-function wrapSCCP(sccpUdt){
-  const m3ua = m3uaData(sccpUdt, 1, 2, 3, 2);   // OPC=1 DPC=2 SI=3(SCCP) NI=2(national)
-  const l4   = sctp(2905, 2905, 3, m3ua);       // PPID=3 (M3UA)
-  const l3   = ipv4("10.0.0.1", "10.0.0.2", 132, l4);
+function pointCodeToIp(pc){
+  // Stable synthetic IPv4 address derived from the 24-bit MTP3 point code.
+  return "10." + ((pc >>> 16) & 0xff) + "." + ((pc >>> 8) & 0xff) + "." + (pc & 0xff);
+}
+function wrapSCCP(sccpUdt, opc=1, dpc=2, sls=0){
+  const m3ua = m3uaData(sccpUdt, opc, dpc, 3, 0, sls); // SI=3 (SCCP), NI=0 from captured M3UA DATA
+  const l4   = sctp(2905, 2905, 3, m3ua);               // PPID=3 (M3UA)
+  const l3   = ipv4(pointCodeToIp(opc), pointCodeToIp(dpc), 132, l4);
   return eth(MAC_A, MAC_B, l3);
 }
 
@@ -260,8 +264,70 @@ function hasInapApplicationContext(bytes){
   return false;
 }
 
+
+/* ---------- TCAP extraction and INAP dialogue tracking ---------- */
+function berLength(bytes, offset){
+  if(offset >= bytes.length) return null;
+  const first = bytes[offset];
+  if(first < 0x80) return { length:first, next:offset+1 };
+  const count = first & 0x7f;
+  if(count === 0 || count > 4 || offset + 1 + count > bytes.length) return null;
+  let length = 0;
+  for(let i=0;i<count;i++) length = (length * 256) + bytes[offset+1+i];
+  return { length, next:offset+1+count };
+}
+function extractTcapFromSccpUdt(sccp){
+  if(!sccp || sccp.length < 6 || sccp[0] !== 0x09) return null;
+  const dataPointer = sccp[4];
+  const lengthOffset = 4 + dataPointer;
+  if(lengthOffset >= sccp.length) return null;
+  const dataLength = sccp[lengthOffset];
+  const start = lengthOffset + 1;
+  if(start + dataLength > sccp.length || dataLength < 2) return null;
+  const tcap = sccp.subarray(start, start + dataLength);
+  return [0x61,0x62,0x64,0x65,0x67].includes(tcap[0]) ? tcap : null;
+}
+function parseTcapTransactionIds(tcap){
+  if(!tcap || tcap.length < 2) return null;
+  const outer = berLength(tcap,1);
+  if(!outer) return null;
+  let pos = outer.next;
+  const end = Math.min(tcap.length, pos + outer.length);
+  let otid = null, dtid = null;
+  while(pos + 2 <= end){
+    const tag = tcap[pos++];
+    const l = berLength(tcap,pos);
+    if(!l || l.next + l.length > end) break;
+    if(tag === 0x48) otid = Array.from(tcap.subarray(l.next,l.next+l.length)).map(x=>x.toString(16).padStart(2,"0")).join("");
+    if(tag === 0x49) dtid = Array.from(tcap.subarray(l.next,l.next+l.length)).map(x=>x.toString(16).padStart(2,"0")).join("");
+    pos = l.next + l.length;
+  }
+  return { type:tcap[0], otid, dtid };
+}
+function trackInapDialogue(tcap, dialogs){
+  const ids = parseTcapTransactionIds(tcap);
+  if(!ids) return false;
+  const oidPresent = hasInapApplicationContext(tcap);
+  let isInap = oidPresent;
+  if(ids.type === 0x62 || ids.type === 0x61){
+    if(ids.otid && oidPresent) dialogs.set(ids.otid,true);
+    return isInap;
+  }
+  if(ids.type === 0x65){
+    if(ids.dtid && dialogs.get(ids.dtid)) isInap = true;
+    if(ids.otid && isInap) dialogs.set(ids.otid,true);
+    return isInap;
+  }
+  if(ids.type === 0x64 || ids.type === 0x67){
+    if(ids.dtid && dialogs.get(ids.dtid)) isInap = true;
+    if(ids.dtid) dialogs.delete(ids.dtid);
+    return isInap;
+  }
+  return isInap;
+}
+
 /* ---------- record -> packet ---------- */
-function buildPacket(rec){
+function buildPacket(rec, tcapDialogs){
   const iface = rec.iface || "";
   const body  = rec.bodyLines;
   if(!body.length) return null;
@@ -299,10 +365,17 @@ function buildPacket(rec){
   if(iface === "TRC_MI_SCCPDPC_MSG" && rec.type === "UDT"){
     if(!bytes || bytes.length <= 12 || bytes[12] !== 0x09) return null;
     const sccpUdt = bytes.subarray(12);
+    // Huawei's 12-byte SCCPDPC prefix carries the 24-bit OPC and DPC
+    // in bytes 6..8 and 9..11, followed by the SCCP UDT at byte 12.
+    const opc = (bytes[6] << 16) | (bytes[7] << 8) | bytes[8];
+    const dpc = (bytes[9] << 16) | (bytes[10] << 8) | bytes[11];
+    const sls = bytes[5];
+    const tcap = extractTcapFromSccpUdt(sccpUdt);
+    const inap = tcap ? trackInapDialogue(tcap, tcapDialogs) : false;
     return {
       kind: "tcap",
-      inap: hasInapApplicationContext(sccpUdt),
-      data: wrapSCCP(sccpUdt)
+      inap,
+      data: wrapSCCP(sccpUdt, opc, dpc, sls)
     };
   }
 
@@ -344,8 +417,9 @@ function convert(text){
   const packets = [];
   let sipN = 0, m3uaN = 0, tcapN = 0, inapN = 0, skipN = 0;
 
+  const tcapDialogs = new Map();
   for(const r of recs){
-    const p = buildPacket(r);
+    const p = buildPacket(r, tcapDialogs);
     if(!p){ skipN++; continue; }
     packets.push({ ts: parseTs(r.ts), data: p.data });
     if(p.kind === "sip")       sipN++;
