@@ -92,9 +92,14 @@ function extractHexdump(lines){
     const data = numbered ? numbered[1] : ln.trim();
     if(!data) continue;
     const tokens = data.split(/\s+/);
-    // PTMF exports may contain either "NN> AA BB CC" rows or a
-    // single space-separated hex string after [Msg Body].
-    if(tokens.every(t => /^[0-9A-Fa-f]{2}$/.test(t))){
+    if(numbered){
+      // Numbered hexdump rows may include an ASCII column after the bytes.
+      for(const t of tokens){
+        if(!/^[0-9A-Fa-f]{2}$/.test(t)) break;
+        bytes.push(parseInt(t,16));
+      }
+    } else if(tokens.every(t => /^[0-9A-Fa-f]{2}$/.test(t))){
+      // PTMF export: one space-separated hex string after [Msg Body].
       for(const t of tokens) bytes.push(parseInt(t,16));
     }
   }
