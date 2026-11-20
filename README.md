@@ -16,6 +16,14 @@ The TCAP BER payload is preserved byte-for-byte inside SCCP user data. The conve
 
 The converter uses `TRC_MI_SCCPDPC_MSG` as the network-facing packet source. It does not separately emit `TRC_MI_TCAPUSER_MSG`, `TRC_MI_FROM_CAP`, `TRC_MI_TO_CAP`, `TRC_MI_TCAPSCCP_MSG`, or `TRC_MI_SCCPUSER_MSG` primitive/interface views as additional packets, avoiding duplicate representations of the same exchange.
 
+### Validation against the supplied `ss7 to pcap.txt`
+
+- 609 trace records parsed.
+- 14 `TRC_MI_SCCPDPC_MSG / UDT` records contained a valid SCCP UDT and TCAP BER payload.
+- All 14 were associated with an INAP CS2 dialogue by following the TCAP transaction IDs; only six records carry the application-context OID themselves.
+- The extracted OPC/DPC and SLS values were cross-checked against corresponding `TRC_MI_M3UA_LINKSET` records in the same trace.
+- The reconstructed packet builder produced 14 Ethernet frames with structurally consistent IPv4, SCTP and M3UA lengths and matching OPC/DPC values. A Wireshark GUI decode has not yet been independently verified.
+
 ## Reconstruction notes
 
 - For `TRC_MI_SCCPDPC_MSG`, the 24-bit OPC and DPC are read from the PTMF prefix and placed into the M3UA Protocol Data parameter. Stable synthetic IPv4 addresses are derived from those point codes, preserving source/destination direction across packets. The SLS is also retained; SI is set to SCCP (3) and NI is set to 0, matching the corresponding captured M3UA linkset record.
