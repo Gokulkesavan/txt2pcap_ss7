@@ -320,7 +320,8 @@ function trackInapDialogue(tcap, dialogs){
   }
   if(ids.type === 0x64 || ids.type === 0x67){
     if(ids.dtid && dialogs.get(ids.dtid)) isInap = true;
-    if(ids.dtid) dialogs.delete(ids.dtid);
+    // Keep the transaction ID for the remainder of this trace. Some Huawei
+    // captures expose both terminal indications for the same dialogue.
     return isInap;
   }
   return isInap;
