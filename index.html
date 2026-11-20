@@ -227,8 +227,8 @@ function pointCodeToIp(pc){
   // Stable synthetic IPv4 address derived from the 24-bit MTP3 point code.
   return "10." + ((pc >>> 16) & 0xff) + "." + ((pc >>> 8) & 0xff) + "." + (pc & 0xff);
 }
-function wrapSCCP(sccpUdt, opc=1, dpc=2, sls=0){
-  const m3ua = m3uaData(sccpUdt, opc, dpc, 3, 0, sls); // SI=3 (SCCP), NI=0 from captured M3UA DATA
+function wrapSCCP(sccpUdt, opc=1, dpc=2, sls=0, ni=2){
+  const m3ua = m3uaData(sccpUdt, opc, dpc, 3, ni, sls); // SI=3 (SCCP); NI supplied by source format
   const l4   = sctp(2905, 2905, 3, m3ua);               // PPID=3 (M3UA)
   const l3   = ipv4(pointCodeToIp(opc), pointCodeToIp(dpc), 132, l4);
   return eth(MAC_A, MAC_B, l3);
@@ -310,7 +310,7 @@ function trackInapDialogue(tcap, dialogs){
   const oidPresent = hasInapApplicationContext(tcap);
   let isInap = oidPresent;
   if(ids.type === 0x62 || ids.type === 0x61){
-    if(ids.otid && oidPresent) dialogs.set(ids.otid,true);
+    if(ids.otid) dialogs.set(ids.otid,oidPresent);
     return isInap;
   }
   if(ids.type === 0x65){
@@ -376,7 +376,7 @@ function buildPacket(rec, tcapDialogs){
     return {
       kind: "tcap",
       inap,
-      data: wrapSCCP(sccpUdt, opc, dpc, sls)
+      data: wrapSCCP(sccpUdt, opc, dpc, sls, 0)
     };
   }
 
