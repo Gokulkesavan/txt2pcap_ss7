@@ -120,9 +120,14 @@ function extractHexdump(lines){
 }
 
 function isSIPMessage(lines){
-  for(const ln of lines){ const t=ln.trim(); if(!t) continue;
-    return /^(INVITE|ACK|BYE|CANCEL|REGISTER|OPTIONS|INFO|UPDATE|PRACK|REFER|SUBSCRIBE|NOTIFY|MESSAGE|SIP\/2\.0)\b/.test(t); }
-  return false;
+  // PTMF exports often put a shortened hex preview immediately after
+  // [Msg Body]. Do not let that preview mask the actual SIP start line.
+  return lines.some(ln => /^(INVITE|ACK|BYE|CANCEL|REGISTER|OPTIONS|INFO|UPDATE|PRACK|REFER|SUBSCRIBE|NOTIFY|MESSAGE|SIP\/2\.0)\b/.test(ln.trim()));
+}
+
+function sipTextLines(lines){
+  const start = lines.findIndex(ln => /^(INVITE|ACK|BYE|CANCEL|REGISTER|OPTIONS|INFO|UPDATE|PRACK|REFER|SUBSCRIBE|NOTIFY|MESSAGE|SIP\/2\.0)\b/.test(ln.trim()));
+  return start >= 0 ? lines.slice(start) : [];
 }
 
 function sipBytes(lines){
@@ -395,7 +400,8 @@ function buildPacket(rec, tcapDialogs){
   if(/FROM_SIP|TO_SIP/.test(iface) && (isSIPMessage(body) || sipIsHex)){
     const sa = parseAddr(rec.src) || {ip:DUMMY.src, port:5060};
     const da = parseAddr(rec.dst) || {ip:DUMMY.dst, port:5060};
-    const p  = sipIsHex ? bytes : sipBytes(body);
+    const textLines = sipTextLines(body);
+    const p  = sipIsHex ? bytes : sipBytes(textLines);
     const l4 = udp(sa.port||5060, da.port||5060, p);
     const l3 = ipv4(sa.ip, da.ip, 17, l4);
     return { kind: "sip", data: ethFor(sa.ip, da.ip, l3) };
