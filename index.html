@@ -20,11 +20,16 @@
 <body>
 
 <h1>SS7 hexdump → PCAP</h1>
-<p class="hint">Converts <code>badAUS.txt</code> (SIP / M3UA / SCCP / MTP3 hexdumps) into a Wireshark-readable <code>.pcap</code>.</p>
+<p class="hint">Converts text traces (SIP, H.248, M3UA/SCCP/TCAP hexdumps) into a Wireshark-readable <code>.pcap</code>. IPs/ports come from the record when present; otherwise from the message itself (H.248 MID, MTP3 point codes) or dummy values.</p>
 
 <label>1. Select the trace file</label>
 <input type="file" id="file" accept=".txt,.log">
 
+<label>INAP SSN of this environment (SCCP subsystem number of the INAP application / SCP)</label>
+<input type="number" id="inapSsn" value="122" min="1" max="254" style="width:90px">
+<label>Rewrite INAP SSN to (optional; blank = keep as in trace, 241&ndash;254 decodes in Wireshark without a preference)</label>
+<input type="number" id="ssnRewrite" min="1" max="254" style="width:90px">
+<label><input type="checkbox" id="rawAll" style="display:inline"> Also include internal/unmapped records as UDP with dummy headers (raw body)</label>
 <label>2. Convert</label>
 <button id="convert" disabled>Convert → PCAP</button>
 
@@ -166,8 +171,9 @@ function sctp(sp, dp, ppid, payload){
   b[o++]=(ppid>>>8)&0xff;  b[o++]=ppid&0xff;
   b.set(payload,o);
   const cs = crc32c(b);
-  b[8]=(cs>>>24)&0xff; b[9]=(cs>>>16)&0xff;
-  b[10]=(cs>>>8)&0xff; b[11]=cs&0xff;
+  // CRC32c is a reflected CRC: its bytes go on the wire least-significant first.
+  b[8]=cs&0xff; b[9]=(cs>>>8)&0xff;
+  b[10]=(cs>>>16)&0xff; b[11]=(cs>>>24)&0xff;
   return b;
 }
 
@@ -221,6 +227,11 @@ function writePcap(packets){
 
 const MAC_A = new Uint8Array([0x02,0,0,0,0,0x01]);
 const MAC_B = new Uint8Array([0x02,0,0,0,0,0x02]);
+// Dummy defaults used whenever the record carries no usable address.
+const DUMMY = { src:"10.255.0.1", dst:"10.255.0.2", sport:40000, dport:40001 };
+const macFor = ip => new Uint8Array([0x02,0,...ipBytes(ip)]);   // stable synthetic MAC per IP
+const isIp = s => /^\d{1,3}(\.\d{1,3}){3}$/.test(s||"");
+function ethFor(srcIp,dstIp,l3){ return eth(macFor(srcIp), macFor(dstIp), l3); }
 
 /* ---------- wrap an SCCP UDT chunk into M3UA/SCTP/IP/Eth ---------- */
 function pointCodeToIp(pc){
@@ -250,9 +261,9 @@ function findSCCPProtoClass(bytes, startSearch){
 }
 
 /* ---------- INAP application-context identification ---------- */
-// ETSI INAP CS2 application-context OID seen in the supplied Huawei trace:
-// 0.0.17.773.5.1.1.1 => 06 07 00 11 86 05 01 01 01
-const INAP_CS2_OID = new Uint8Array([0x06,0x07,0x00,0x11,0x86,0x05,0x01,0x01,0x01]);
+// INAP application-context seen in the Huawei trace: 0.3.4605.1.1.1.x => 06 08 03 A3 7D 01 01 01 ...
+// (0.0.17.773.1.1.1 = 06 07 00 11 86 05 01 01 01 is only the TCAP dialogue AS-ID, present in every dialogue.)
+const INAP_CS2_OID = new Uint8Array([0x06,0x08,0x03,0xa3,0x7d,0x01,0x01,0x01]);
 function hasInapApplicationContext(bytes){
   if(!bytes) return false;
   outer: for(let i=0;i<=bytes.length-INAP_CS2_OID.length;i++){
@@ -264,6 +275,29 @@ function hasInapApplicationContext(bytes){
   return false;
 }
 
+
+/* ---------- SCCP SSNs (called, calling) of a UDT ---------- */
+let cfg = { ssn:122, rewrite:null };
+function ssnOffsets(u){           // byte offsets of the SSN in called/calling address
+  const out = [];
+  for(const ptrIdx of [2,3]){
+    const o = ptrIdx + u[ptrIdx];
+    if(o + 2 >= u.length) continue;
+    const ind = u[o+1];
+    if(ind & 0x02) out.push(o + 2 + ((ind & 0x01) ? 2 : 0));
+  }
+  return out;
+}
+const sccpSsns = u => ssnOffsets(u).map(o => u[o]);
+// INAP = application context OR dialogue tracking OR either SCCP address uses the SSN entered in the UI.
+// Returns {inap, ssns}; optionally rewrites the SSN in place (must run before SCTP checksum is computed).
+function classifyInap(sccp, tcap, dialogs){
+  let inap = tcap ? trackInapDialogue(tcap, dialogs) : false;
+  if(tcap && !inap && sccpSsns(sccp).includes(cfg.ssn)) inap = true;
+  const ssns = inap ? sccpSsns(sccp) : [];
+  if(inap && cfg.rewrite != null) for(const o of ssnOffsets(sccp)) if(sccp[o] === cfg.ssn) sccp[o] = cfg.rewrite;
+  return { inap, ssns };
+}
 
 /* ---------- TCAP extraction and INAP dialogue tracking ---------- */
 function berLength(bytes, offset){
@@ -327,6 +361,20 @@ function trackInapDialogue(tcap, dialogs){
   return isInap;
 }
 
+/* ---------- H.248 helpers ---------- */
+let h248Peers = {};
+function findH248Ber(b){          // [len16][30 ...] where len16 == remaining bytes
+  for(let i=16;i<Math.min(b.length-3,128);i++)
+    if(b[i+2]===0x30 && ((b[i]<<8)|b[i+1]) === b.length-i-2) return i+2;
+  return -1;
+}
+function midOf(ber){              // first ip4Address {[0] 4 octets, [1] port} inside the message
+  for(let i=0;i<Math.min(ber.length-12,64);i++)
+    if(ber[i]===0xa0 && ber[i+2]===0x80 && ber[i+3]===4 && ber[i+8]===0x81 && ber[i+9]===2)
+      return { ip: Array.from(ber.subarray(i+4,i+8)).join("."), port: (ber[i+10]<<8)|ber[i+11] };
+  return null;
+}
+
 /* ---------- record -> packet ---------- */
 function buildPacket(rec, tcapDialogs){
   const iface = rec.iface || "";
@@ -341,13 +389,39 @@ function buildPacket(rec, tcapDialogs){
   const decodedHex = bytes ? new TextDecoder().decode(bytes) : "";
   const sipIsHex = !!bytes && isSIPMessage([decodedHex]);
   if(/FROM_SIP|TO_SIP/.test(iface) && (isSIPMessage(body) || sipIsHex)){
-    const sa = parseAddr(rec.src), da = parseAddr(rec.dst);
-    if(sa && da){
-      const p  = sipIsHex ? bytes : sipBytes(body);
-      const l4 = udp(sa.port||5060, da.port||5060, p);
-      const l3 = ipv4(sa.ip, da.ip, 17, l4);
-      return { kind: "sip", data: eth(MAC_A, MAC_B, l3) };
+    const sa = parseAddr(rec.src) || {ip:DUMMY.src, port:5060};
+    const da = parseAddr(rec.dst) || {ip:DUMMY.dst, port:5060};
+    const p  = sipIsHex ? bytes : sipBytes(body);
+    const l4 = udp(sa.port||5060, da.port||5060, p);
+    const l3 = ipv4(sa.ip, da.ip, 17, l4);
+    return { kind: "sip", data: ethFor(sa.ip, da.ip, l3) };
+  }
+
+  // 1b) H.248 (BER) over UDP/2945. Record = module header + [len16][BER MegacoMessage].
+  //     Sender MID (ip4Address) gives the MGC/MGW IP:port; the peer is learned from the opposite direction.
+  if(/TO_H248|FROM_H248/.test(iface) && bytes){
+    const ber = findH248Ber(bytes);
+    if(ber >= 0){
+      const toMgw = /TO_H248/.test(iface);
+      const mid = midOf(bytes.subarray(ber));
+      if(mid) h248Peers[toMgw ? "mgc" : "mgw"] = mid;
+      const mgc = h248Peers.mgc || {ip:DUMMY.src, port:2945};
+      const mgw = h248Peers.mgw || {ip:DUMMY.dst, port:2945};
+      const s = toMgw ? mgc : mgw, d = toMgw ? mgw : mgc;
+      const l4 = udp(s.port||2945, d.port||2945, bytes.subarray(ber));
+      return { kind:"h248", data: ethFor(s.ip, d.ip, ipv4(s.ip, d.ip, 17, l4)) };
     }
+  }
+
+  // 1c) Real M3UA DATA captured at the linkset (carries true NI/SLS). Point codes -> synthetic IPs.
+  if(iface === "TRC_MI_M3UA_LINKSET"){
+    if(!bytes || bytes.length < 24 || bytes[0] !== 1 || bytes[2] !== 1 || bytes[3] !== 1) return null;
+    const pc = o => ((bytes[o]<<24)|(bytes[o+1]<<16)|(bytes[o+2]<<8)|bytes[o+3])>>>0;
+    const s = pointCodeToIp(pc(12)), d = pointCodeToIp(pc(16));
+    const sccp = bytes.subarray(24), tcap = extractTcapFromSccpUdt(sccp);
+    const { inap, ssns } = classifyInap(sccp, tcap, tcapDialogs);
+    const l3 = ipv4(s, d, 132, sctp(2905, 2905, 3, bytes));
+    return { kind: tcap ? "tcap" : "m3ua", inap, ssns, data: ethFor(s, d, l3) };
   }
 
   // 2) M3UA already on the wire
@@ -372,10 +446,11 @@ function buildPacket(rec, tcapDialogs){
     const dpc = (bytes[9] << 16) | (bytes[10] << 8) | bytes[11];
     const sls = bytes[5];
     const tcap = extractTcapFromSccpUdt(sccpUdt);
-    const inap = tcap ? trackInapDialogue(tcap, tcapDialogs) : false;
+    const { inap, ssns } = classifyInap(sccpUdt, tcap, tcapDialogs);
     return {
       kind: "tcap",
       inap,
+      ssns,
       data: wrapSCCP(sccpUdt, opc, dpc, sls, 0)
     };
   }
@@ -412,6 +487,8 @@ function buildPacket(rec, tcapDialogs){
 /* ---------- main ---------- */
 function convert(text){
   sctpTSN = 0;
+  const num = id => { const e = document.getElementById(id), v = e && parseInt(e.value, 10); return Number.isInteger(v) && v >= 1 && v <= 254 ? v : null; };
+  cfg = { ssn: num("inapSsn") || 122, rewrite: num("ssnRewrite") };
   const recs = parseRecords(text);
   log("Records parsed: " + recs.length);
 
@@ -419,11 +496,40 @@ function convert(text){
   let sipN = 0, m3uaN = 0, tcapN = 0, inapN = 0, skipN = 0;
 
   const tcapDialogs = new Map();
+  // Pre-pass: learn H.248 MGC/MGW endpoints and the SCCP payloads already carried by real M3UA records.
+  h248Peers = {};
+  const lsSccp = [];
   for(const r of recs){
-    const p = buildPacket(r, tcapDialogs);
+    if(/H248/.test(r.iface) && r.iface[0] !== "T"){
+      const b = extractHexdump(r.bodyLines), o = b ? findH248Ber(b) : -1, m = o >= 0 ? midOf(b.subarray(o)) : null;
+      if(m) h248Peers[/TO_H248/.test(r.iface) ? "mgc" : "mgw"] = m;
+    }
+    if(r.iface === "TRC_MI_M3UA_LINKSET"){ const b = extractHexdump(r.bodyLines); if(b) lsSccp.push(b.subarray(24)); }
+  }
+  const rawAll = document.getElementById("rawAll") && document.getElementById("rawAll").checked;
+  let h248N = 0, rawN = 0;
+  const inapSsns = new Set();
+  for(const r of recs){
+    // SCCPDPC UDT duplicates the M3UA linkset record (same SCCP bytes) -> keep only the M3UA one.
+    if(r.iface === "TRC_MI_SCCPDPC_MSG"){
+      const b = extractHexdump(r.bodyLines);
+      if(b && b.length > 12){
+        const u = b.subarray(12);   // M3UA pads to 4 bytes, so compare as prefix + <=3 zero pad bytes
+        if(lsSccp.some(l => l.length >= u.length && l.length - u.length < 4 && u.every((x,i) => x === l[i]))){ skipN++; continue; }
+      }
+    }
+    let p = buildPacket(r, tcapDialogs);
+    if(!p && rawAll){            // dummy-header fallback: raw body as UDP
+      const b = extractHexdump(r.bodyLines);
+      if(b){ const l4 = udp(DUMMY.sport, DUMMY.dport, b); p = { kind:"raw", data: ethFor(DUMMY.src, DUMMY.dst, ipv4(DUMMY.src, DUMMY.dst, 17, l4)) }; rawN++; }
+    }
     if(!p){ skipN++; continue; }
+    if(p.kind === "h248") h248N++;
+    if(p.ssns) p.ssns.forEach(s => inapSsns.add(s));
     packets.push({ ts: parseTs(r.ts), data: p.data });
     if(p.kind === "sip")       sipN++;
+    else if(p.kind === "raw")  { /* counted in rawN */ }
+    else if(p.kind === "h248") { /* counted in h248N */ }
     else if(p.kind === "tcap"){
       tcapN++;
       if(p.inap) inapN++;
@@ -434,11 +540,24 @@ function convert(text){
   log("SS7 packets (M3UA): " + m3uaN);
   log("TCAP packets       : " + tcapN);
   log("INAP CS2 packets   : " + inapN);
+  log("H.248 packets     : " + h248N);
+  log("Raw/dummy packets  : " + rawN);
   log("Skipped           : " + skipN);
   log("Total packets     : " + packets.length);
   log("----");
   log("TCAP/CAP BER payloads are preserved inside SCCP user data.");
-  log("Wireshark filter: sip || m3ua || sccp || tcap || gsm_map");
+  log("Wireshark filter: sip || h248 || m3ua || sccp || tcap || gsm_map || inap || camel");
+  if(inapN){
+    const seen = Array.from(inapSsns).sort((a,b)=>a-b).join(",");
+    log("SSNs seen on INAP packets: " + seen + "   (INAP SSN entered: " + cfg.ssn + ")");
+    if(!inapSsns.has(cfg.ssn)) log("WARNING: entered SSN was not seen on any INAP packet - check the value.");
+    if(cfg.rewrite != null){
+      log("INAP SSN " + cfg.ssn + " rewritten to " + cfg.rewrite + " in the pcap.");
+      if(cfg.rewrite < 241 || cfg.rewrite > 254) log("Wireshark: INAP > Subsystem numbers = " + cfg.rewrite + "  (default INAP range is 241-254)");
+    } else {
+      log("Wireshark: Edit > Preferences > Protocols > INAP > Subsystem numbers = " + cfg.ssn + "   (or: tshark -o inap.ssn:" + cfg.ssn + " -r file.pcap)");
+    }
+  }
 
   return writePcap(packets);
 }
