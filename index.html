@@ -178,11 +178,15 @@ function sctp(sp, dp, ppid, payload){
 }
 
 /* ---------- M3UA DATA (with mandatory Protocol Data TLV) ---------- */
-function m3uaData(payload, opc, dpc, si, ni, sls=0){
+function m3uaData(payload, opc, dpc, si, ni, sls=0, mp=0){
   const pdValueLen = 12 + payload.length;
   const pdParamLen = 4 + pdValueLen;
-  const msgLen     = 8 + pdParamLen;
-  const b = new Uint8Array(msgLen);
+  // M3UA parameters are padded to a 32-bit boundary. The parameter's
+  // Length field excludes padding, while the common-header Message Length
+  // includes it.
+  const pdPadding  = (4 - (pdParamLen % 4)) % 4;
+  const msgLen     = 8 + pdParamLen + pdPadding;
+  const b = new Uint8Array(msgLen); // zero-initialized padding
 
   b[0]=1; b[1]=0; b[2]=1; b[3]=1;
   b[4]=(msgLen>>>24)&0xff; b[5]=(msgLen>>>16)&0xff;
@@ -196,7 +200,7 @@ function m3uaData(payload, opc, dpc, si, ni, sls=0){
   b[12]=(opc>>>24)&0xff; b[13]=(opc>>>16)&0xff; b[14]=(opc>>>8)&0xff; b[15]=opc&0xff;
   b[16]=(dpc>>>24)&0xff; b[17]=(dpc>>>16)&0xff; b[18]=(dpc>>>8)&0xff; b[19]=dpc&0xff;
   // SI / NI / MP / SLS
-  b[20]=si; b[21]=ni; b[22]=0; b[23]=sls;
+  b[20]=si; b[21]=ni; b[22]=mp; b[23]=sls;
   b.set(payload, 24);
   return b;
 }
@@ -238,8 +242,8 @@ function pointCodeToIp(pc){
   // Stable synthetic IPv4 address derived from the 24-bit MTP3 point code.
   return "10." + ((pc >>> 16) & 0xff) + "." + ((pc >>> 8) & 0xff) + "." + (pc & 0xff);
 }
-function wrapSCCP(sccpUdt, opc=1, dpc=2, sls=0, ni=2){
-  const m3ua = m3uaData(sccpUdt, opc, dpc, 3, ni, sls); // SI=3 (SCCP); NI supplied by source format
+function wrapSCCP(sccpUdt, opc=1, dpc=2, sls=0, ni=2, mp=0, si=3){
+  const m3ua = m3uaData(sccpUdt, opc, dpc, si, ni, sls, mp);
   const l4   = sctp(2905, 2905, 3, m3ua);               // PPID=3 (M3UA)
   const l3   = ipv4(pointCodeToIp(opc), pointCodeToIp(dpc), 132, l4);
   return eth(MAC_A, MAC_B, l3);
@@ -445,13 +449,20 @@ function buildPacket(rec, tcapDialogs){
     const opc = (bytes[6] << 16) | (bytes[7] << 8) | bytes[8];
     const dpc = (bytes[9] << 16) | (bytes[10] << 8) | bytes[11];
     const sls = bytes[5];
+    // MTP3 SIO: NI occupies bits 7..6, priority/MP bits 5..4,
+    // and service indicator/SI bits 3..0. Preserve the values from
+    // the trace instead of forcing every reconstructed packet to NI=0.
+    const sio = bytes[1];
+    const ni = (sio >>> 6) & 0x03;
+    const mp = (sio >>> 4) & 0x03;
+    const si = sio & 0x0f;
     const tcap = extractTcapFromSccpUdt(sccpUdt);
     const { inap, ssns } = classifyInap(sccpUdt, tcap, tcapDialogs);
     return {
       kind: "tcap",
       inap,
       ssns,
-      data: wrapSCCP(sccpUdt, opc, dpc, sls, 0)
+      data: wrapSCCP(sccpUdt, opc, dpc, sls, ni, mp, si)
     };
   }
 
